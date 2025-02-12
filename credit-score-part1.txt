@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IDeFiProtocol {
+    function getUserDebt(address user) external view returns (uint256);
+    function getUserCollateral(address user) external view returns (uint256);
+}
+
+interface IPerpProtocol {
+    function getUserPositions(address user) external view returns (
+        uint256 totalPositions,
+        uint256 profitablePositions,
+        uint256 liquidatedPositions
+    );
+    function getPositionHealth(address user) external view returns (uint256);
+    function getTradingVolume(address user) external view returns (uint256);
+}
+
+contract OnChainCreditScoring is Initializable, UUPSUpgradeable, ReentrancyGuard {
+    // Constants
+    uint256 public constant MIN_SCORE = 300;
+    uint256 public constant MAX_SCORE = 850;
+    uint256 public constant LENDING_WEIGHT = 50;    // %50 lending protokolleri
+    uint256 public constant PERP_WEIGHT = 30;       // %30 perp protokolleri
+    uint256 public constant HISTORY_WEIGHT = 20;    // %20 kullanım geçmişi
+    uint256 public constant MAX_HISTORY_YEARS = 5;  // Maksimum 5 yıl için puan
+
+    // Protocol types
+    enum ProtocolType { LENDING, PERP }
+
+    // User history tracking
+    struct UserHistory {
+        uint256 firstInteractionTime;
+        bool isActive;
+        uint256 interactionCount;
+        uint256 lastInteractionTime;
+    }
+
+    // Protocol struct
+    struct Protocol {
+        bool isActive;
+        ProtocolType protocolType;
+    }
+
+    // State variables
+    address public owner;
+    address public guardian;
+    address public pendingOwner;
+    mapping(address => uint256) public creditScores;
+    mapping(address => Protocol) public protocols;
+    mapping(address => UserHistory) public userHistories;
+    address[] public protocolList;
+    bool public paused;
+    
+    // Version control for upgrades
+    uint256 public version;
+
+    // Custom Errors
+    error NotOwner();
+    error NotGuardian();
+    error NotPendingOwner();
+    error NotAuthorized();
+    error ZeroAddress();
+    error ContractPaused();
+    error ProtocolNotFound();
+    error ProtocolAlreadyExists();
+    error InvalidScore();
+    error InvalidProtocolType();
+    error AlreadyInitialized();
+
+    // Events
+    event CreditScoreUpdated(address indexed user, uint256 score);
+    event ProtocolAdded(address indexed protocol, ProtocolType protocolType);
+    event ProtocolRemoved(address indexed protocol);
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
+    event ContractPaused(address indexed by);
+    event ContractUnpaused(address indexed by);
+    event UserFirstInteraction(address indexed user, uint256 timestamp);
+    event UserInteraction(address indexed user, uint256 timestamp);
+    event ContractUpgraded(uint256 newVersion);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // Gap for future storage variables in upgrades
+    uint256[50] private __gap;
+}

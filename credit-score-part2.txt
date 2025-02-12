@@ -1,0 +1,170 @@
+// Modifiers
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    modifier onlyGuardian() {
+        if (msg.sender != guardian && msg.sender != owner) revert NotGuardian();
+        _;
+    }
+
+    modifier whenNotPaused() {
+        if (paused) revert ContractPaused();
+        _;
+    }
+
+    modifier updateUserHistory(address user) {
+        UserHistory storage history = userHistories[user];
+        
+        if (!history.isActive) {
+            history.firstInteractionTime = block.timestamp;
+            history.isActive = true;
+            emit UserFirstInteraction(user, block.timestamp);
+        }
+        
+        history.interactionCount++;
+        history.lastInteractionTime = block.timestamp;
+        emit UserInteraction(user, block.timestamp);
+        
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    function initialize() public initializer {
+        owner = msg.sender;
+        guardian = msg.sender;
+        version = 1;
+    }
+
+    // Core calculation functions
+    function calculateLendingScore(address user) public view whenNotPaused returns (uint256) {
+        uint256 totalDebt;
+        uint256 totalCollateral;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            address protocol = protocolList[i];
+            if (!protocols[protocol].isActive || 
+                protocols[protocol].protocolType != ProtocolType.LENDING) continue;
+            
+            try IDeFiProtocol(protocol).getUserDebt(user) returns (uint256 debt) {
+                totalDebt += debt;
+            } catch {
+                continue;
+            }
+            
+            try IDeFiProtocol(protocol).getUserCollateral(user) returns (uint256 collateral) {
+                totalCollateral += collateral;
+            } catch {
+                continue;
+            }
+        }
+        
+        if (totalCollateral == 0) return MIN_SCORE;
+        if (totalDebt == 0) return MAX_SCORE;
+        
+        uint256 ratio = (totalCollateral * 100) / totalDebt;
+        uint256 score = MIN_SCORE + (ratio * 5);
+        
+        return score > MAX_SCORE ? MAX_SCORE : score;
+    }
+
+    function calculatePerpScore(address user) public view whenNotPaused returns (uint256) {
+        uint256 totalScore;
+        uint256 protocolCount;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            address protocol = protocolList[i];
+            if (!protocols[protocol].isActive || 
+                protocols[protocol].protocolType != ProtocolType.PERP) continue;
+            
+            try IPerpProtocol(protocol).getUserPositions(user) returns (
+                uint256 totalPositions,
+                uint256 profitablePositions,
+                uint256 liquidatedPositions
+            ) {
+                if (totalPositions == 0) continue;
+                
+                uint256 healthFactor;
+                uint256 volume;
+                
+                try IPerpProtocol(protocol).getPositionHealth(user) returns (uint256 health) {
+                    healthFactor = health;
+                } catch {
+                    healthFactor = 0;
+                }
+                
+                try IPerpProtocol(protocol).getTradingVolume(user) returns (uint256 tradingVolume) {
+                    volume = tradingVolume;
+                } catch {
+                    volume = 0;
+                }
+                
+                uint256 profitRatio = (profitablePositions * 100) / totalPositions;
+                uint256 liquidationRatio = (liquidatedPositions * 100) / totalPositions;
+                uint256 healthScore = healthFactor / 1e16;
+                
+                uint256 protocolScore = (
+                    (profitRatio * 30) +             // %30 kârlı işlem oranı
+                    ((100 - liquidationRatio) * 40) + // %40 likidite edilmeme oranı
+                    (healthScore * 30)                // %30 pozisyon sağlığı
+                ) / 100;
+                
+                totalScore += protocolScore;
+                protocolCount++;
+            } catch {
+                continue;
+            }
+        }
+        
+        if (protocolCount == 0) return MIN_SCORE;
+        uint256 averageScore = totalScore / protocolCount;
+        return MIN_SCORE + ((MAX_SCORE - MIN_SCORE) * averageScore) / 100;
+    }
+
+    function calculateHistoryScore(address user) public view whenNotPaused returns (uint256) {
+        UserHistory memory history = userHistories[user];
+        if (!history.isActive) return 0;
+
+        uint256 usageTimeInYears = (block.timestamp - history.firstInteractionTime) / 365 days;
+        
+        uint256 interactionScore = 0;
+        if (history.lastInteractionTime > block.timestamp - 30 days) {
+            interactionScore = 50;
+        } else if (history.lastInteractionTime > block.timestamp - 90 days) {
+            interactionScore = 30;
+        } else if (history.lastInteractionTime > block.timestamp - 180 days) {
+            interactionScore = 15;
+        }
+
+        uint256 timeScore = (usageTimeInYears * 50) / MAX_HISTORY_YEARS;
+        if (timeScore > 50) timeScore = 50;
+
+        return interactionScore + timeScore;
+    }
+
+    function calculateCreditScore(address user) public view whenNotPaused returns (uint256) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        uint256 lendingScore = calculateLendingScore(user);
+        uint256 perpScore = calculatePerpScore(user);
+        uint256 historyScore = calculateHistoryScore(user);
+        
+        uint256 finalScore = (
+            (lendingScore * LENDING_WEIGHT) + 
+            (perpScore * PERP_WEIGHT) +
+            (historyScore * HISTORY_WEIGHT)
+        ) / 100;
+        
+        if (finalScore > MAX_SCORE) revert InvalidScore();
+        return finalScore;
+    }
+
+    function updateCreditScore(address user) public nonReentrant whenNotPaused updateUserHistory(user) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        uint256 score = calculateCreditScore(user);
+        creditScores[user] = score;
+        
+        emit CreditScoreUpdated(user, score);
+    }

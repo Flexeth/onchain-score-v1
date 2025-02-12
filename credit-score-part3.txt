@@ -1,0 +1,136 @@
+// Admin management functions
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
+        pendingOwner = newOwner;
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        emit OwnershipTransferred(owner, pendingOwner);
+        owner = pendingOwner;
+        pendingOwner = address(0);
+    }
+
+    function updateGuardian(address newGuardian) external onlyOwner {
+        if (newGuardian == address(0)) revert ZeroAddress();
+        address oldGuardian = guardian;
+        guardian = newGuardian;
+        emit GuardianUpdated(oldGuardian, newGuardian);
+    }
+
+    // Protocol management functions
+    function addProtocol(address _protocol, ProtocolType _type) external 
+        onlyOwner 
+        whenNotPaused 
+        nonReentrant 
+    {
+        if (_protocol == address(0)) revert ZeroAddress();
+        if (protocols[_protocol].isActive) revert ProtocolAlreadyExists();
+        
+        // Protocol interface check
+        if (_type == ProtocolType.LENDING) {
+            try IDeFiProtocol(_protocol).getUserDebt(address(this)) returns (uint256) {
+                // Interface check passed
+            } catch {
+                revert InvalidProtocolType();
+            }
+        } else if (_type == ProtocolType.PERP) {
+            try IPerpProtocol(_protocol).getUserPositions(address(this)) returns 
+                (uint256, uint256, uint256) {
+                // Interface check passed
+            } catch {
+                revert InvalidProtocolType();
+            }
+        }
+        
+        protocols[_protocol] = Protocol({
+            isActive: true,
+            protocolType: _type
+        });
+        protocolList.push(_protocol);
+        
+        emit ProtocolAdded(_protocol, _type);
+    }
+
+    function removeProtocol(address _protocol) external 
+        onlyOwner 
+        whenNotPaused 
+        nonReentrant 
+    {
+        if (!protocols[_protocol].isActive) revert ProtocolNotFound();
+
+        protocols[_protocol].isActive = false;
+        
+        // Remove from array efficiently
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (protocolList[i] == _protocol) {
+                protocolList[i] = protocolList[protocolList.length - 1];
+                protocolList.pop();
+                break;
+            }
+        }
+        
+        emit ProtocolRemoved(_protocol);
+    }
+
+    // Pause management
+    function pause() external onlyGuardian nonReentrant {
+        if (paused) revert ContractPaused();
+        paused = true;
+        emit ContractPaused(msg.sender);
+    }
+
+    function unpause() external onlyOwner nonReentrant {
+        if (!paused) revert ContractPaused();
+        paused = false;
+        emit ContractUnpaused(msg.sender);
+    }
+
+    // Upgrade functions
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        // Update version
+        version += 1;
+        emit ContractUpgraded(version);
+    }
+
+    // Emergency functions
+    function emergencyProtocolRemoval(address _protocol) external onlyGuardian nonReentrant {
+        if (!protocols[_protocol].isActive) revert ProtocolNotFound();
+        
+        protocols[_protocol].isActive = false;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (protocolList[i] == _protocol) {
+                protocolList[i] = protocolList[protocolList.length - 1];
+                protocolList.pop();
+                break;
+            }
+        }
+        
+        emit ProtocolRemoved(_protocol);
+    }
+
+    // Protocol validation helper
+    function _validateProtocolInterface(address _protocol, ProtocolType _type) internal view {
+        if (_type == ProtocolType.LENDING) {
+            // Check required functions exist
+            require(
+                IDeFiProtocol(_protocol).getUserDebt.selector == bytes4(keccak256("getUserDebt(address)")),
+                "Invalid lending protocol interface"
+            );
+            require(
+                IDeFiProtocol(_protocol).getUserCollateral.selector == bytes4(keccak256("getUserCollateral(address)")),
+                "Invalid lending protocol interface"
+            );
+        } else if (_type == ProtocolType.PERP) {
+            // Check required functions exist
+            require(
+                IPerpProtocol(_protocol).getUserPositions.selector == bytes4(keccak256("getUserPositions(address)")),
+                "Invalid perp protocol interface"
+            );
+            require(
+                IPerpProtocol(_protocol).getPositionHealth.selector == bytes4(keccak256("getPositionHealth(address)")),
+                "Invalid perp protocol interface"
+            );
+        }
+    }

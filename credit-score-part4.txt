@@ -1,0 +1,155 @@
+// View functions
+    function getDetailedScores(address user) public view returns (
+        uint256 lendingScore,
+        uint256 perpScore,
+        uint256 historyScore,
+        uint256 finalScore,
+        UserHistory memory history
+    ) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        lendingScore = calculateLendingScore(user);
+        perpScore = calculatePerpScore(user);
+        historyScore = calculateHistoryScore(user);
+        finalScore = calculateCreditScore(user);
+        history = userHistories[user];
+    }
+
+    function getUserHistory(address user) public view returns (
+        uint256 firstInteraction,
+        uint256 interactionCount,
+        uint256 lastInteraction,
+        bool isActive
+    ) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        UserHistory memory history = userHistories[user];
+        return (
+            history.firstInteractionTime,
+            history.interactionCount,
+            history.lastInteractionTime,
+            history.isActive
+        );
+    }
+
+    function getProtocolDetails(address protocol) public view returns (
+        bool isActive,
+        ProtocolType protocolType,
+        bool exists
+    ) {
+        Protocol memory p = protocols[protocol];
+        return (p.isActive, p.protocolType, p.isActive); // isActive check is sufficient for exists
+    }
+
+    function getActiveProtocols() public view returns (
+        address[] memory lendingProtocols,
+        address[] memory perpProtocols
+    ) {
+        uint256 lendingCount = 0;
+        uint256 perpCount = 0;
+        
+        // Count active protocols of each type
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (!protocols[protocolList[i]].isActive) continue;
+            
+            if (protocols[protocolList[i]].protocolType == ProtocolType.LENDING) {
+                lendingCount++;
+            } else {
+                perpCount++;
+            }
+        }
+        
+        // Initialize arrays with correct sizes
+        lendingProtocols = new address[](lendingCount);
+        perpProtocols = new address[](perpCount);
+        
+        // Fill arrays
+        uint256 lendingIndex = 0;
+        uint256 perpIndex = 0;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (!protocols[protocolList[i]].isActive) continue;
+            
+            if (protocols[protocolList[i]].protocolType == ProtocolType.LENDING) {
+                lendingProtocols[lendingIndex++] = protocolList[i];
+            } else {
+                perpProtocols[perpIndex++] = protocolList[i];
+            }
+        }
+    }
+
+    function getContractStats() public view returns (
+        uint256 totalProtocols,
+        uint256 activeProtocols,
+        uint256 version_,
+        bool paused_,
+        address owner_,
+        address guardian_
+    ) {
+        uint256 active = 0;
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (protocols[protocolList[i]].isActive) active++;
+        }
+        
+        return (
+            protocolList.length,
+            active,
+            version,
+            paused,
+            owner,
+            guardian
+        );
+    }
+
+    function getCreditScore(address user) public view returns (uint256) {
+        if (user == address(0)) revert ZeroAddress();
+        return creditScores[user];
+    }
+
+    // Utility functions
+    function isContract(address account) internal view returns (bool) {
+        uint256 size;
+        assembly {
+            size := extcodesize(account)
+        }
+        return size > 0;
+    }
+
+    function getChainId() public view returns (uint256) {
+        uint256 chainId;
+        assembly {
+            chainId := chainid()
+        }
+        return chainId;
+    }
+
+    // Batch operations
+    function updateMultipleCreditScores(address[] calldata users) external 
+        whenNotPaused 
+        nonReentrant 
+    {
+        if (users.length == 0) revert InvalidScore();
+        if (users.length > 100) revert InvalidScore(); // Prevent too large batches
+        
+        for (uint i = 0; i < users.length; i++) {
+            if (users[i] == address(0)) continue;
+            updateCreditScore(users[i]);
+        }
+    }
+
+    // Extension point for future versions
+    function getImplementation() external view returns (address) {
+        return _getImplementation();
+    }
+
+    // Function to receive ETH (if needed)
+    receive() external payable {
+        emit ContractPaused(msg.sender); // Log unexpected ETH receives
+        revert("ETH not accepted");
+    }
+
+    // Fallback to revert any unknown function calls
+    fallback() external {
+        revert("Function not found");
+    }
+}
