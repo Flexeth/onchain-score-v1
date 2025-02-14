@@ -1,0 +1,557 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IDeFiProtocol {
+    function getUserDebt(address user) external view returns (uint256);
+    function getUserCollateral(address user) external view returns (uint256);
+}
+
+interface IPerpProtocol {
+    function getUserPositions(address user) external view returns (
+        uint256 totalPositions,
+        uint256 profitablePositions,
+        uint256 liquidatedPositions
+    );
+    function getPositionHealth(address user) external view returns (uint256);
+    function getTradingVolume(address user) external view returns (uint256);
+}
+
+contract OnChainCreditScoring is Initializable, UUPSUpgradeable, ReentrancyGuard {
+    // Constants
+    uint256 public constant MIN_SCORE = 300;
+    uint256 public constant MAX_SCORE = 850;
+    uint256 public constant LENDING_WEIGHT = 50;    // %50 lending protokolleri
+    uint256 public constant PERP_WEIGHT = 30;       // %30 perp protokolleri
+    uint256 public constant HISTORY_WEIGHT = 20;    // %20 kullanım geçmişi
+    uint256 public constant MAX_HISTORY_YEARS = 5;  // Maksimum 5 yıl için puan
+
+    // Protocol types
+    enum ProtocolType { LENDING, PERP }
+
+    // User history tracking
+    struct UserHistory {
+        uint256 firstInteractionTime;
+        bool isActive;
+        uint256 interactionCount;
+        uint256 lastInteractionTime;
+    }
+
+    // Protocol struct
+    struct Protocol {
+        bool isActive;
+        ProtocolType protocolType;
+    }
+
+    // State variables
+    address public owner;
+    address public guardian;
+    address public pendingOwner;
+    mapping(address => uint256) public creditScores;
+    mapping(address => Protocol) public protocols;
+    mapping(address => UserHistory) public userHistories;
+    address[] public protocolList;
+    bool public paused;
+    
+    // Version control for upgrades
+    uint256 public version;
+
+    // Custom Errors
+    error NotOwner();
+    error NotGuardian();
+    error NotPendingOwner();
+    error NotAuthorized();
+    error ZeroAddress();
+    error ContractPaused();
+    error ProtocolNotFound();
+    error ProtocolAlreadyExists();
+    error InvalidScore();
+    error InvalidProtocolType();
+    error AlreadyInitialized();
+
+    // Events
+    event CreditScoreUpdated(address indexed user, uint256 score);
+    event ProtocolAdded(address indexed protocol, ProtocolType protocolType);
+    event ProtocolRemoved(address indexed protocol);
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
+    event ContractPaused(address indexed by);
+    event ContractUnpaused(address indexed by);
+    event UserFirstInteraction(address indexed user, uint256 timestamp);
+    event UserInteraction(address indexed user, uint256 timestamp);
+    event ContractUpgraded(uint256 newVersion);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // Gap for future storage variables in upgrades
+    uint256[50] private __gap;
+
+    // Modifiers
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    modifier onlyGuardian() {
+        if (msg.sender != guardian && msg.sender != owner) revert NotGuardian();
+        _;
+    }
+
+    modifier whenNotPaused() {
+        if (paused) revert ContractPaused();
+        _;
+    }
+
+    modifier updateUserHistory(address user) {
+        UserHistory storage history = userHistories[user];
+        
+        if (!history.isActive) {
+            history.firstInteractionTime = block.timestamp;
+            history.isActive = true;
+            emit UserFirstInteraction(user, block.timestamp);
+        }
+        
+        history.interactionCount++;
+        history.lastInteractionTime = block.timestamp;
+        emit UserInteraction(user, block.timestamp);
+        
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    function initialize() public initializer {
+        owner = msg.sender;
+        guardian = msg.sender;
+        version = 1;
+    }
+
+    // Core calculation functions
+    function calculateLendingScore(address user) public view whenNotPaused returns (uint256) {
+        uint256 totalDebt;
+        uint256 totalCollateral;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            address protocol = protocolList[i];
+            if (!protocols[protocol].isActive || 
+                protocols[protocol].protocolType != ProtocolType.LENDING) continue;
+            
+            try IDeFiProtocol(protocol).getUserDebt(user) returns (uint256 debt) {
+                totalDebt += debt;
+            } catch {
+                continue;
+            }
+            
+            try IDeFiProtocol(protocol).getUserCollateral(user) returns (uint256 collateral) {
+                totalCollateral += collateral;
+            } catch {
+                continue;
+            }
+        }
+        
+        if (totalCollateral == 0) return MIN_SCORE;
+        if (totalDebt == 0) return MAX_SCORE;
+        
+        uint256 ratio = (totalCollateral * 100) / totalDebt;
+        uint256 score = MIN_SCORE + (ratio * 5);
+        
+        return score > MAX_SCORE ? MAX_SCORE : score;
+    }
+
+    function calculatePerpScore(address user) public view whenNotPaused returns (uint256) {
+        uint256 totalScore;
+        uint256 protocolCount;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            address protocol = protocolList[i];
+            if (!protocols[protocol].isActive || 
+                protocols[protocol].protocolType != ProtocolType.PERP) continue;
+            
+            try IPerpProtocol(protocol).getUserPositions(user) returns (
+                uint256 totalPositions,
+                uint256 profitablePositions,
+                uint256 liquidatedPositions
+            ) {
+                if (totalPositions == 0) continue;
+                
+                uint256 healthFactor;
+                uint256 volume;
+                
+                try IPerpProtocol(protocol).getPositionHealth(user) returns (uint256 health) {
+                    healthFactor = health;
+                } catch {
+                    healthFactor = 0;
+                }
+                
+                try IPerpProtocol(protocol).getTradingVolume(user) returns (uint256 tradingVolume) {
+                    volume = tradingVolume;
+                } catch {
+                    volume = 0;
+                }
+                
+                uint256 profitRatio = (profitablePositions * 100) / totalPositions;
+                uint256 liquidationRatio = (liquidatedPositions * 100) / totalPositions;
+                uint256 healthScore = healthFactor / 1e16;
+                
+                uint256 protocolScore = (
+                    (profitRatio * 30) +             // %30 kârlı işlem oranı
+                    ((100 - liquidationRatio) * 40) + // %40 likidite edilmeme oranı
+                    (healthScore * 30)                // %30 pozisyon sağlığı
+                ) / 100;
+                
+                totalScore += protocolScore;
+                protocolCount++;
+            } catch {
+                continue;
+            }
+        }
+        
+        if (protocolCount == 0) return MIN_SCORE;
+        uint256 averageScore = totalScore / protocolCount;
+        return MIN_SCORE + ((MAX_SCORE - MIN_SCORE) * averageScore) / 100;
+    }
+
+    function calculateHistoryScore(address user) public view whenNotPaused returns (uint256) {
+        UserHistory memory history = userHistories[user];
+        if (!history.isActive) return 0;
+
+        uint256 usageTimeInYears = (block.timestamp - history.firstInteractionTime) / 365 days;
+        
+        uint256 interactionScore = 0;
+        if (history.lastInteractionTime > block.timestamp - 30 days) {
+            interactionScore = 50;
+        } else if (history.lastInteractionTime > block.timestamp - 90 days) {
+            interactionScore = 30;
+        } else if (history.lastInteractionTime > block.timestamp - 180 days) {
+            interactionScore = 15;
+        }
+
+        uint256 timeScore = (usageTimeInYears * 50) / MAX_HISTORY_YEARS;
+        if (timeScore > 50) timeScore = 50;
+
+        return interactionScore + timeScore;
+    }
+
+    function calculateCreditScore(address user) public view whenNotPaused returns (uint256) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        uint256 lendingScore = calculateLendingScore(user);
+        uint256 perpScore = calculatePerpScore(user);
+        uint256 historyScore = calculateHistoryScore(user);
+        
+        uint256 finalScore = (
+            (lendingScore * LENDING_WEIGHT) + 
+            (perpScore * PERP_WEIGHT) +
+            (historyScore * HISTORY_WEIGHT)
+        ) / 100;
+        
+        if (finalScore > MAX_SCORE) revert InvalidScore();
+        return finalScore;
+    }
+
+    function updateCreditScore(address user) public nonReentrant whenNotPaused updateUserHistory(user) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        uint256 score = calculateCreditScore(user);
+        creditScores[user] = score;
+        
+        emit CreditScoreUpdated(user, score);
+    }
+
+    // Admin management functions
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
+        pendingOwner = newOwner;
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        emit OwnershipTransferred(owner, pendingOwner);
+        owner = pendingOwner;
+        pendingOwner = address(0);
+    }
+
+    function updateGuardian(address newGuardian) external onlyOwner {
+        if (newGuardian == address(0)) revert ZeroAddress();
+        address oldGuardian = guardian;
+        guardian = newGuardian;
+        emit GuardianUpdated(oldGuardian, newGuardian);
+    }
+
+    // Protocol management functions
+    function addProtocol(address _protocol, ProtocolType _type) external 
+        onlyOwner 
+        whenNotPaused 
+        nonReentrant 
+    {
+        if (_protocol == address(0)) revert ZeroAddress();
+        if (protocols[_protocol].isActive) revert ProtocolAlreadyExists();
+        
+        // Protocol interface check
+        if (_type == ProtocolType.LENDING) {
+            try IDeFiProtocol(_protocol).getUserDebt(address(this)) returns (uint256) {
+                // Interface check passed
+            } catch {
+                revert InvalidProtocolType();
+            }
+        } else if (_type == ProtocolType.PERP) {
+            try IPerpProtocol(_protocol).getUserPositions(address(this)) returns 
+                (uint256, uint256, uint256) {
+                // Interface check passed
+            } catch {
+                revert InvalidProtocolType();
+            }
+        }
+        
+        protocols[_protocol] = Protocol({
+            isActive: true,
+            protocolType: _type
+        });
+        protocolList.push(_protocol);
+        
+        emit ProtocolAdded(_protocol, _type);
+    }
+
+    function removeProtocol(address _protocol) external 
+        onlyOwner 
+        whenNotPaused 
+        nonReentrant 
+    {
+        if (!protocols[_protocol].isActive) revert ProtocolNotFound();
+
+        protocols[_protocol].isActive = false;
+        
+        // Remove from array efficiently
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (protocolList[i] == _protocol) {
+                protocolList[i] = protocolList[protocolList.length - 1];
+                protocolList.pop();
+                break;
+            }
+        }
+        
+        emit ProtocolRemoved(_protocol);
+    }
+
+    // Pause management
+    function pause() external onlyGuardian nonReentrant {
+        if (paused) revert ContractPaused();
+        paused = true;
+        emit ContractPaused(msg.sender);
+    }
+
+    function unpause() external onlyOwner nonReentrant {
+        if (!paused) revert ContractPaused();
+        paused = false;
+        emit ContractUnpaused(msg.sender);
+    }
+
+    // Upgrade functions
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        // Update version
+        version += 1;
+        emit ContractUpgraded(version);
+    }
+
+    // Emergency functions
+    function emergencyProtocolRemoval(address _protocol) external onlyGuardian nonReentrant {
+        if (!protocols[_protocol].isActive) revert ProtocolNotFound();
+        
+        protocols[_protocol].isActive = false;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (protocolList[i] == _protocol) {
+                protocolList[i] = protocolList[protocolList.length - 1];
+                protocolList.pop();
+                break;
+            }
+        }
+        
+        emit ProtocolRemoved(_protocol);
+    }
+
+    // Protocol validation helper
+    function _validateProtocolInterface(address _protocol, ProtocolType _type) internal view {
+        if (_type == ProtocolType.LENDING) {
+            // Check required functions exist
+            require(
+                IDeFiProtocol(_protocol).getUserDebt.selector == bytes4(keccak256("getUserDebt(address)")),
+                "Invalid lending protocol interface"
+            );
+            require(
+                IDeFiProtocol(_protocol).getUserCollateral.selector == bytes4(keccak256("getUserCollateral(address)")),
+                "Invalid lending protocol interface"
+            );
+        } else if (_type == ProtocolType.PERP) {
+            // Check required functions exist
+            require(
+                IPerpProtocol(_protocol).getUserPositions.selector == bytes4(keccak256("getUserPositions(address)")),
+                "Invalid perp protocol interface"
+            );
+            require(
+                IPerpProtocol(_protocol).getPositionHealth.selector == bytes4(keccak256("getPositionHealth(address)")),
+                "Invalid perp protocol interface"
+            );
+        }
+    }
+
+    // View functions
+    function getDetailedScores(address user) public view returns (
+        uint256 lendingScore,
+        uint256 perpScore,
+        uint256 historyScore,
+        uint256 finalScore,
+        UserHistory memory history
+    ) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        lendingScore = calculateLendingScore(user);
+        perpScore = calculatePerpScore(user);
+        historyScore = calculateHistoryScore(user);
+        finalScore = calculateCreditScore(user);
+        history = userHistories[user];
+    }
+
+    function getUserHistory(address user) public view returns (
+        uint256 firstInteraction,
+        uint256 interactionCount,
+        uint256 lastInteraction,
+        bool isActive
+    ) {
+        if (user == address(0)) revert ZeroAddress();
+        
+        UserHistory memory history = userHistories[user];
+        return (
+            history.firstInteractionTime,
+            history.interactionCount,
+            history.lastInteractionTime,
+            history.isActive
+        );
+    }
+
+    function getProtocolDetails(address protocol) public view returns (
+        bool isActive,
+        ProtocolType protocolType,
+        bool exists
+    ) {
+        Protocol memory p = protocols[protocol];
+        return (p.isActive, p.protocolType, p.isActive); // isActive check is sufficient for exists
+    }
+
+    function getActiveProtocols() public view returns (
+        address[] memory lendingProtocols,
+        address[] memory perpProtocols
+    ) {
+        uint256 lendingCount = 0;
+        uint256 perpCount = 0;
+        
+        // Count active protocols of each type
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (!protocols[protocolList[i]].isActive) continue;
+            
+            if (protocols[protocolList[i]].protocolType == ProtocolType.LENDING) {
+                lendingCount++;
+            } else {
+                perpCount++;
+            }
+        }
+        
+        // Initialize arrays with correct sizes
+        lendingProtocols = new address[](lendingCount);
+        perpProtocols = new address[](perpCount);
+        
+        // Fill arrays
+        uint256 lendingIndex = 0;
+        uint256 perpIndex = 0;
+        
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (!protocols[protocolList[i]].isActive) continue;
+            
+            if (protocols[protocolList[i]].protocolType == ProtocolType.LENDING) {
+                lendingProtocols[lendingIndex++] = protocolList[i];
+            } else {
+                perpProtocols[perpIndex++] = protocolList[i];
+            }
+        }
+    }
+
+    function getContractStats() public view returns (
+        uint256 totalProtocols,
+        uint256 activeProtocols,
+        uint256 version_,
+        bool paused_,
+        address owner_,
+        address guardian_
+    ) {
+        uint256 active = 0;
+        for (uint i = 0; i < protocolList.length; i++) {
+            if (protocols[protocolList[i]].isActive) active++;
+        }
+        
+        return (
+            protocolList.length,
+            active,
+            version,
+            paused,
+            owner,
+            guardian
+        );
+    }
+
+    function getCreditScore(address user) public view returns (uint256) {
+        if (user == address(0)) revert ZeroAddress();
+        return creditScores[user];
+    }
+
+    // Utility functions
+    function isContract(address account) internal view returns (bool) {
+        uint256 size;
+        assembly {
+            size := extcodesize(account)
+        }
+        return size > 0;
+    }
+
+    function getChainId() public view returns (uint256) {
+        uint256 chainId;
+        assembly {
+            chainId := chainid()
+        }
+        return chainId;
+    }
+
+    // Batch operations
+    function updateMultipleCreditScores(address[] calldata users) external 
+        whenNotPaused 
+        nonReentrant 
+    {
+        if (users.length == 0) revert InvalidScore();
+        if (users.length > 100) revert InvalidScore(); // Prevent too large batches
+        
+        for (uint i = 0; i < users.length; i++) {
+            if (users[i] == address(0)) continue;
+            updateCreditScore(users[i]);
+        }
+    }
+
+    // Extension point for future versions
+    function getImplementation() external view returns (address) {
+        return _getImplementation();
+    }
+
+    // Function to receive ETH (if needed)
+    receive() external payable {
+        emit ContractPaused(msg.sender); // Log unexpected ETH receives
+        revert("ETH not accepted");
+    }
+
+    // Fallback to revert any unknown function calls
+    fallback() external {
+        revert("Function not found");
+    }
+}
